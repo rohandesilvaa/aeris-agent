@@ -1,0 +1,48 @@
+# Dependencies and package-manager cache
+node_modules/
+.pnpm-store/
+
+# Frontend build output
+dist/
+coverage/
+*.tsbuildinfo
+
+# Rust / Tauri build output
+src-tauri/target/
+src-tauri/gen/
+
+# Local model files (never commit large model weights)
+*.gguf
+*.ggml
+models/
+
+# Environment files and local configuration
+.env
+.env.*
+!.env.example
+*.local
+
+# Logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.bak
