@@ -66,6 +66,15 @@ pub struct ChatRequest {
     pub identity_response: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VoiceConfig {
+    pub whisper_binary_path: String,
+    pub whisper_model_path: String,
+    pub ffmpeg_path: String,
+    pub language: String,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StreamEvent {

@@ -8,14 +8,17 @@ import {
   Cpu,
   Eraser,
   Gauge,
+  Keyboard,
   LoaderCircle,
   MessageSquare,
+  Mic,
   Pencil,
   Play,
   Plus,
   Send,
   Settings2,
   Sparkles,
+  Square,
   Trash2,
   UserRound,
   X,
@@ -42,6 +45,14 @@ type ServerConfig = {
 };
 type Usage = { prompt: number; completion: number };
 type PersonaConfig = { prompt: string; identityResponse: string };
+type ViewMode = "text" | "voice";
+type VoiceState = "idle" | "listening" | "transcribing" | "thinking" | "speaking" | "error";
+type VoiceConfig = {
+  whisperBinaryPath: string;
+  whisperModelPath: string;
+  ffmpegPath: string;
+  language: string;
+};
 type StreamEvent = {
   type: "chunk" | "usage" | "done" | "error";
   requestId: string;
@@ -52,6 +63,15 @@ type StreamEvent = {
   tokensPerSecond?: number;
   title?: string;
   message?: string;
+};
+
+const VOICE_LABELS: Record<VoiceState, string> = {
+  idle: "Tap the core and speak",
+  listening: "Listening… tap to send",
+  transcribing: "Transcribing locally…",
+  thinking: "Aeris is thinking…",
+  speaking: "Aeris is speaking…",
+  error: "Voice needs attention",
 };
 
 const DEFAULT_CONFIG: ServerConfig = {
@@ -76,6 +96,13 @@ Address him as Rohan only when it feels natural, not in every response.`,
   identityResponse: "I'm Aeris, Rohan's personal AI assistant. I run privately on Rohan's Mac to help him think, create, plan, learn, and get things done.",
 };
 
+const DEFAULT_VOICE_CONFIG: VoiceConfig = {
+  whisperBinaryPath: "/opt/homebrew/bin/whisper-cli",
+  whisperModelPath: "/Volumes/ROHAN DISK/Local Models/ggml-small.en-q5_1.bin",
+  ffmpegPath: "/opt/homebrew/bin/ffmpeg",
+  language: "en",
+};
+
 const uid = () => crypto.randomUUID();
 
 function loadConfig(): ServerConfig {
@@ -94,6 +121,28 @@ function loadPersona(): PersonaConfig {
   }
 }
 
+function loadVoiceConfig(): VoiceConfig {
+  try {
+    const stored = { ...DEFAULT_VOICE_CONFIG, ...JSON.parse(localStorage.getItem("aeris.voice") ?? "{}") };
+    if (stored.whisperModelPath.endsWith("/ggml-small.bin")) {
+      stored.whisperModelPath = DEFAULT_VOICE_CONFIG.whisperModelPath;
+    }
+    stored.language = "en";
+    return stored;
+  } catch {
+    return DEFAULT_VOICE_CONFIG;
+  }
+}
+
+function blobToBase64(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error("Could not read microphone audio."));
+    reader.onloadend = () => resolve(String(reader.result).split(",")[1] ?? "");
+    reader.readAsDataURL(blob);
+  });
+}
+
 function legacyMessages(): Array<{ id?: string; role: Role; content: string }> {
   if (localStorage.getItem("aeris.sqlite-migrated")) return [];
   try {
@@ -110,6 +159,10 @@ export default function App() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [config, setConfig] = useState<ServerConfig>(loadConfig);
   const [persona, setPersona] = useState<PersonaConfig>(loadPersona);
+  const [voiceConfig, setVoiceConfig] = useState<VoiceConfig>(loadVoiceConfig);
+  const [viewMode, setViewMode] = useState<ViewMode>("text");
+  const [voiceState, setVoiceState] = useState<VoiceState>("idle");
+  const [voiceTranscript, setVoiceTranscript] = useState("");
   const [input, setInput] = useState("");
   const [status, setStatus] = useState<Status>("offline");
   const [generating, setGenerating] = useState(false);
@@ -125,8 +178,13 @@ export default function App() {
   const messagesRef = useRef<HTMLDivElement>(null);
   const autoScrollRef = useRef(true);
   const generationRequestRef = useRef<string | null>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
+  const audioChunksRef = useRef<Blob[]>([]);
+  const recordingTimeoutRef = useRef<number | null>(null);
   const bootstrapStartedRef = useRef(false);
   const chatLoadRef = useRef(0);
+  const statusRef = useRef<Status>("offline");
 
   const activeChat = chats.find((chat) => chat.id === activeChatId);
   const usedTokens = usage.prompt + usage.completion;
@@ -145,6 +203,20 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem("aeris.persona", JSON.stringify(persona));
   }, [persona]);
+
+  useEffect(() => {
+    localStorage.setItem("aeris.voice", JSON.stringify(voiceConfig));
+  }, [voiceConfig]);
+
+  useEffect(() => {
+    statusRef.current = status;
+  }, [status]);
+
+  useEffect(() => () => {
+    if (recordingTimeoutRef.current !== null) window.clearTimeout(recordingTimeoutRef.current);
+    mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
+    window.speechSynthesis?.cancel();
+  }, []);
 
   useEffect(() => {
     if (autoScrollRef.current) {
@@ -282,9 +354,12 @@ export default function App() {
   }
 
   async function cancelCurrentGeneration() {
+    cancelVoiceRecording();
     const requestId = generationRequestRef.current;
     generationRequestRef.current = null;
     setGenerating(false);
+    window.speechSynthesis?.cancel();
+    setVoiceState("idle");
     if (requestId) {
       try { await invoke("cancel_generation", { requestId }); } catch { /* request may already be done */ }
     }
@@ -317,9 +392,9 @@ export default function App() {
     autoScrollRef.current = container.scrollHeight - container.scrollTop - container.clientHeight < 80;
   }
 
-  async function sendMessage(event?: FormEvent) {
+  async function sendMessage(event?: FormEvent, voiceText?: string) {
     event?.preventDefault();
-    const text = input.trim();
+    const text = (voiceText ?? input).trim();
     if (!text || generating || status !== "online" || !activeChatId) return;
 
     const requestId = uid();
@@ -331,12 +406,15 @@ export default function App() {
     setInput("");
     setError("");
     setGenerating(true);
+    if (viewMode === "voice") setVoiceState("thinking");
     setTokensPerSecond(0);
 
     const channel = new Channel<StreamEvent>();
+    let completeResponse = "";
     channel.onmessage = (event) => {
       if (event.requestId !== generationRequestRef.current) return;
       if (event.type === "chunk" && event.content) {
+        completeResponse += event.content;
         setMessages((current) => current.map((message) => message.id === assistantMessage.id
           ? { ...message, content: message.content + event.content }
           : message));
@@ -352,6 +430,7 @@ export default function App() {
       if (event.type === "done") {
         generationRequestRef.current = null;
         setGenerating(false);
+        if (viewMode === "voice" && completeResponse.trim()) speakResponse(completeResponse);
         setChats((current) => {
           const updated = current.map((chat) => chat.id === activeChatId
             ? { ...chat, title: event.title ?? chat.title, updatedAt: Date.now() }
@@ -363,6 +442,7 @@ export default function App() {
         generationRequestRef.current = null;
         setGenerating(false);
         setError(event.message ?? "The local model request failed.");
+        if (viewMode === "voice") setVoiceState("error");
         setMessages((current) => current.filter((message) => message.id !== assistantMessage.id || message.content));
       }
     };
@@ -386,9 +466,113 @@ export default function App() {
         generationRequestRef.current = null;
         setGenerating(false);
         setError(String(cause));
+        if (viewMode === "voice") setVoiceState("error");
         setMessages((current) => current.filter((message) => message.id !== assistantMessage.id || message.content));
       }
     }
+  }
+
+  async function startVoiceRecording() {
+    setError("");
+    setVoiceTranscript("");
+    window.speechSynthesis?.cancel();
+    try {
+      if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === "undefined") {
+        throw new Error("Microphone recording is not available in this WebView.");
+      }
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
+      mediaStreamRef.current = stream;
+      const preferredType = ["audio/mp4", "audio/webm;codecs=opus", "audio/webm"].find((type) => MediaRecorder.isTypeSupported(type));
+      const recorder = new MediaRecorder(stream, preferredType ? { mimeType: preferredType } : undefined);
+      audioChunksRef.current = [];
+      recorder.ondataavailable = (event) => { if (event.data.size) audioChunksRef.current.push(event.data); };
+      recorder.onstop = () => void transcribeRecording(recorder.mimeType || preferredType || "audio/webm");
+      mediaRecorderRef.current = recorder;
+      recorder.start(250);
+      recordingTimeoutRef.current = window.setTimeout(stopVoiceRecording, 60_000);
+      setVoiceState("listening");
+    } catch (cause) {
+      setVoiceState("error");
+      setError(`Microphone error: ${String(cause)}`);
+    }
+  }
+
+  function stopVoiceRecording() {
+    if (recordingTimeoutRef.current !== null) {
+      window.clearTimeout(recordingTimeoutRef.current);
+      recordingTimeoutRef.current = null;
+    }
+    if (mediaRecorderRef.current?.state === "recording") mediaRecorderRef.current.stop();
+    mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
+    mediaStreamRef.current = null;
+    setVoiceState("transcribing");
+  }
+
+  function cancelVoiceRecording() {
+    if (recordingTimeoutRef.current !== null) {
+      window.clearTimeout(recordingTimeoutRef.current);
+      recordingTimeoutRef.current = null;
+    }
+    const recorder = mediaRecorderRef.current;
+    if (recorder?.state === "recording") {
+      recorder.onstop = null;
+      recorder.stop();
+    }
+    mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
+    mediaStreamRef.current = null;
+    mediaRecorderRef.current = null;
+    audioChunksRef.current = [];
+  }
+
+  async function transcribeRecording(mimeType: string) {
+    try {
+      const blob = new Blob(audioChunksRef.current, { type: mimeType });
+      const transcript = await invoke<string>("transcribe_audio", {
+        audioBase64: await blobToBase64(blob),
+        mimeType,
+        config: voiceConfig,
+      });
+      if (statusRef.current !== "online") throw new Error("The local model went offline before the voice message could be sent.");
+      setVoiceTranscript(transcript);
+      setVoiceState("thinking");
+      await sendMessage(undefined, transcript);
+    } catch (cause) {
+      setVoiceState("error");
+      setError(String(cause));
+    } finally {
+      audioChunksRef.current = [];
+      mediaRecorderRef.current = null;
+    }
+  }
+
+  function speakResponse(text: string) {
+    if (!("speechSynthesis" in window)) {
+      setVoiceState("idle");
+      return;
+    }
+    window.speechSynthesis.cancel();
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.rate = 1.02;
+    utterance.pitch = 0.92;
+    utterance.onstart = () => setVoiceState("speaking");
+    utterance.onend = () => setVoiceState("idle");
+    utterance.onerror = () => setVoiceState("idle");
+    window.speechSynthesis.speak(utterance);
+  }
+
+  function toggleVoice() {
+    if (voiceState === "listening") stopVoiceRecording();
+    else if (voiceState === "speaking") { window.speechSynthesis.cancel(); setVoiceState("idle"); }
+    else if (!generating && voiceState !== "transcribing") void startVoiceRecording();
+  }
+
+  function openVoiceMode() {
+    setViewMode("voice");
+    setError("");
+    void invoke("prepare_voice_server", { config: voiceConfig }).catch((cause) => {
+      setVoiceState("error");
+      setError(`Voice engine error: ${String(cause)}`);
+    });
   }
 
   function handleKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
@@ -445,6 +629,11 @@ export default function App() {
               <span>Used for “Who are you?” and similar questions.</span>
               <button className="ghost compact" onClick={() => setPersona(DEFAULT_PERSONA)}>Reset persona</button>
             </div>
+            <div className="settings-divider wide"><span>LOCAL VOICE</span><p>English Whisper stays loaded locally on port 8092 for faster replies.</p></div>
+            <label className="wide">whisper-cli path<input value={voiceConfig.whisperBinaryPath} onChange={(e) => setVoiceConfig((current) => ({ ...current, whisperBinaryPath: e.target.value }))} /></label>
+            <label className="wide">Whisper model path<input value={voiceConfig.whisperModelPath} onChange={(e) => setVoiceConfig((current) => ({ ...current, whisperModelPath: e.target.value }))} /></label>
+            <label className="wide">ffmpeg path<input value={voiceConfig.ffmpegPath} onChange={(e) => setVoiceConfig((current) => ({ ...current, ffmpegPath: e.target.value }))} /></label>
+            <label>Speech language<input value={voiceConfig.language} readOnly /></label>
           </div>
         </section>
       )}
@@ -494,8 +683,15 @@ export default function App() {
         </aside>
 
         <section className="chat-panel">
-          <div className="conversation-title"><span>{activeChat?.title ?? "New chat"}</span><small>Saved locally</small></div>
-          <div className="messages" ref={messagesRef} onScroll={handleChatScroll}>
+          <div className="conversation-title">
+            <div className="conversation-meta"><span>{activeChat?.title ?? "New chat"}</span><small>Saved locally</small></div>
+            <div className="mode-tabs" role="tablist" aria-label="Conversation mode">
+              <button className={viewMode === "text" ? "active" : ""} disabled={voiceState === "listening" || voiceState === "transcribing"}
+                onClick={() => { setViewMode("text"); window.speechSynthesis?.cancel(); setVoiceState("idle"); }}><Keyboard size={13} /> Text</button>
+              <button className={viewMode === "voice" ? "active" : ""} onClick={openVoiceMode}><Mic size={13} /> Voice</button>
+            </div>
+          </div>
+          {viewMode === "text" ? <div className="messages" ref={messagesRef} onScroll={handleChatScroll}>
             {messages.length === 0 ? (
               <div className="empty-state">
                 <div className="orb"><Bot size={32} /></div>
@@ -513,9 +709,27 @@ export default function App() {
               </article>
             ))}
             <div ref={bottomRef} />
-          </div>
+          </div> : <div className={`voice-stage ${voiceState}`}>
+            <div className="voice-ambient one" /><div className="voice-ambient two" />
+            <button className="voice-core-button" onClick={toggleVoice}
+              disabled={status !== "online" || voiceState === "transcribing" || voiceState === "thinking"}
+              aria-label={voiceState === "listening" ? "Stop recording" : "Start voice input"}>
+              <span className="orbit orbit-one" /><span className="orbit orbit-two" /><span className="orbit orbit-three" />
+              <span className="core-glow"><span className="core-center">{voiceState === "listening" ? <Square size={18} fill="currentColor" /> : <Mic size={23} />}</span></span>
+            </button>
+            <div className="voice-wave" aria-hidden="true">
+              {Array.from({ length: 28 }, (_, index) => <i key={index} style={{ animationDelay: `${index * -0.055}s` }} />)}
+            </div>
+            <h2>{VOICE_LABELS[voiceState]}</h2>
+            <p className="voice-transcript">{voiceTranscript || "Your voice is recorded only after you tap. Transcription stays local."}</p>
+            {messages.filter((message) => message.role === "assistant").slice(-1)[0]?.content && voiceState !== "listening" && (
+              <p className="voice-response">{messages.filter((message) => message.role === "assistant").slice(-1)[0]?.content}</p>
+            )}
+            {error && <div className="error-banner voice-error">{error}</div>}
+            {status === "offline" && <button className="primary voice-start" onClick={startServer}><Play size={15} fill="currentColor" /> Start local model</button>}
+          </div>}
 
-          <div className="composer-wrap">
+          {viewMode === "text" && <div className="composer-wrap">
             {error && <div className="error-banner">{error}</div>}
             <form className="composer" onSubmit={sendMessage}>
               <textarea value={input} onChange={(e) => setInput(e.target.value)} onKeyDown={handleKeyDown}
@@ -526,7 +740,7 @@ export default function App() {
               </button>
             </form>
             <p className="hint">Enter to send · Shift + Enter for a new line · Stored locally in SQLite</p>
-          </div>
+          </div>}
         </section>
       </main>
 

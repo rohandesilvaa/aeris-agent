@@ -1,6 +1,7 @@
 mod database;
 mod inference;
 mod models;
+mod voice;
 
 use database::{initialize, DatabaseState};
 use inference::{GenerationState, ServerState};
@@ -12,6 +13,7 @@ use tauri::Manager;
 pub fn run() {
     tauri::Builder::default()
         .manage(ServerState::default())
+        .manage(voice::VoiceServerState::default())
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
             fs::create_dir_all(&data_dir)?;
@@ -34,6 +36,8 @@ pub fn run() {
             database::delete_chat,
             database::clear_chat,
             database::import_legacy_messages,
+            voice::prepare_voice_server,
+            voice::transcribe_audio,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Aeris")
@@ -45,6 +49,7 @@ pub fn run() {
                         let _ = child.wait();
                     }
                 }
+                voice::stop_managed_server(&app.state::<voice::VoiceServerState>());
             }
         });
 }
