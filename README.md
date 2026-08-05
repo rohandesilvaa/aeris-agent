@@ -1,6 +1,17 @@
-# Aeris Local
+# Aeris
 
-A private Tauri desktop chat app for a local `llama-server` model.
+Rohan's private personal AI agent, built with Tauri, Rust, React, SQLite, and a local `llama-server` model.
+
+## Phase 2 features
+
+- Multiple local chat sessions with create, switch, rename, clear, and delete actions
+- SQLite-backed chat and message persistence
+- Automatic migration of the original localStorage conversation
+- Rust inference proxy with cancellable streaming over Tauri channels
+- Per-chat context usage and generation speed
+- Rust-managed `llama-server` lifecycle with one inference slot for lower memory use
+
+The SQLite database is stored in the app's macOS Application Support directory under the original `com.rohan.aeris-local` identifier so upgrades retain existing chats. Model requests remain local and are proxied by the Rust backend; the webview does not connect to the model server directly.
 
 ## Development
 
@@ -17,7 +28,7 @@ Create an optimized macOS app with:
 pnpm tauri build
 ```
 
-The generated app is at `src-tauri/target/release/bundle/macos/Aeris Local.app`.
+The generated app is at `src-tauri/target/release/bundle/macos/Aeris.app`.
 
 The default settings point to:
 

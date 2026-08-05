@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Default permissions for Aeris Local",
+  "description": "Default permissions for Aeris",
   "windows": ["main"],
   "permissions": ["core:default"]
 }
