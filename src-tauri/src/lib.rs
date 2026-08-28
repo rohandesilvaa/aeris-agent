@@ -27,6 +27,7 @@ pub fn run() {
             inference::start_server,
             inference::stop_server,
             inference::check_server,
+            inference::check_custom_model,
             inference::stream_chat,
             inference::cancel_generation,
             database::list_chats,

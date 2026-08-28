@@ -61,9 +61,20 @@ pub struct ChatRequest {
     pub user_message_id: String,
     pub assistant_message_id: String,
     pub content: String,
+    pub provider: String,
     pub config: ServerConfig,
     pub persona_prompt: String,
     pub identity_response: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomModelInfo {
+    pub configured: bool,
+    pub online: bool,
+    pub model_id: Option<String>,
+    pub base_url: Option<String>,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]

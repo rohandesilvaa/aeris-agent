@@ -1,10 +1,13 @@
 import { FormEvent, KeyboardEvent, useEffect, useRef, useState } from "react";
 import { Channel, invoke } from "@tauri-apps/api/core";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import {
   Bot,
   Check,
   ChevronDown,
   CircleStop,
+  Cloud,
   Cpu,
   Eraser,
   Gauge,
@@ -17,6 +20,7 @@ import {
   Plus,
   Send,
   Settings2,
+  HardDrive,
   Sparkles,
   Square,
   Trash2,
@@ -35,6 +39,7 @@ type ChatSummary = {
   completionTokens: number;
 };
 type Status = "online" | "offline" | "starting";
+type ModelProvider = "local" | "custom";
 type ServerConfig = {
   modelPath: string;
   binaryPath: string;
@@ -52,6 +57,13 @@ type VoiceConfig = {
   whisperModelPath: string;
   ffmpegPath: string;
   language: string;
+};
+type CustomModelInfo = {
+  configured: boolean;
+  online: boolean;
+  modelId?: string;
+  baseUrl?: string;
+  message: string;
 };
 type StreamEvent = {
   type: "chunk" | "usage" | "done" | "error";
@@ -113,6 +125,10 @@ function loadConfig(): ServerConfig {
   }
 }
 
+function loadProvider(): ModelProvider {
+  return localStorage.getItem("aeris.model-provider") === "custom" ? "custom" : "local";
+}
+
 function loadPersona(): PersonaConfig {
   try {
     return { ...DEFAULT_PERSONA, ...JSON.parse(localStorage.getItem("aeris.persona") ?? "{}") };
@@ -153,11 +169,22 @@ function legacyMessages(): Array<{ id?: string; role: Role; content: string }> {
   }
 }
 
+function MarkdownMessage({ content, streaming = false }: { content: string; streaming?: boolean }) {
+  return (
+    <div className="markdown-content">
+      <ReactMarkdown remarkPlugins={[remarkGfm]}>{content}</ReactMarkdown>
+      {streaming && <i className="cursor" />}
+    </div>
+  );
+}
+
 export default function App() {
   const [chats, setChats] = useState<ChatSummary[]>([]);
   const [activeChatId, setActiveChatId] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [config, setConfig] = useState<ServerConfig>(loadConfig);
+  const [provider, setProvider] = useState<ModelProvider>(loadProvider);
+  const [customModel, setCustomModel] = useState<CustomModelInfo | null>(null);
   const [persona, setPersona] = useState<PersonaConfig>(loadPersona);
   const [voiceConfig, setVoiceConfig] = useState<VoiceConfig>(loadVoiceConfig);
   const [viewMode, setViewMode] = useState<ViewMode>("text");
@@ -189,6 +216,7 @@ export default function App() {
   const activeChat = chats.find((chat) => chat.id === activeChatId);
   const usedTokens = usage.prompt + usage.completion;
   const contextPercent = Math.min((usedTokens / config.contextSize) * 100, 100);
+  const customModelName = customModel?.modelId?.split("/").pop()?.replace(/\.gguf$/i, "") ?? "Kaggle API model";
 
   useEffect(() => {
     if (bootstrapStartedRef.current) return;
@@ -199,6 +227,10 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem("aeris.config", JSON.stringify(config));
   }, [config]);
+
+  useEffect(() => {
+    localStorage.setItem("aeris.model-provider", provider);
+  }, [provider]);
 
   useEffect(() => {
     localStorage.setItem("aeris.persona", JSON.stringify(persona));
@@ -227,6 +259,21 @@ export default function App() {
   useEffect(() => {
     let active = true;
     const check = async () => {
+      if (provider === "custom") {
+        try {
+          const info = await invoke<CustomModelInfo>("check_custom_model");
+          if (!active) return;
+          setCustomModel(info);
+          setStatus(info.online ? "online" : "offline");
+          return;
+        } catch (cause) {
+          if (active) {
+            setStatus("offline");
+            setCustomModel({ configured: false, online: false, message: String(cause) });
+          }
+          return;
+        }
+      }
       try {
         const online = await invoke<boolean>("check_server", { config });
         if (!active) return;
@@ -235,10 +282,11 @@ export default function App() {
         if (active) setStatus((current) => current === "starting" ? current : "offline");
       }
     };
+    setStatus("starting");
     void check();
-    const timer = window.setInterval(check, 2500);
+    const timer = window.setInterval(check, provider === "custom" ? 10_000 : 2500);
     return () => { active = false; window.clearInterval(timer); };
-  }, [config]);
+  }, [config, provider]);
 
   async function bootstrapChats() {
     setLoadingChats(true);
@@ -369,6 +417,13 @@ export default function App() {
     setError("");
     setStatus("starting");
     try {
+      if (provider === "custom") {
+        const info = await invoke<CustomModelInfo>("check_custom_model");
+        setCustomModel(info);
+        setStatus(info.online ? "online" : "offline");
+        if (!info.online) setError(info.message);
+        return;
+      }
       await invoke("start_server", { config });
     } catch (cause) {
       setStatus("offline");
@@ -455,6 +510,7 @@ export default function App() {
           userMessageId: userMessage.id,
           assistantMessageId: assistantMessage.id,
           content: text,
+          provider,
           config,
           personaPrompt: persona.prompt,
           identityResponse: persona.identityResponse,
@@ -593,12 +649,20 @@ export default function App() {
           <div><h1>Aeris</h1><span>Rohan's personal AI</span></div>
         </div>
         <div className="header-actions">
+          <label className="provider-picker" aria-label="Model provider">
+            {provider === "local" ? <HardDrive size={14} /> : <Cloud size={14} />}
+            <select value={provider} onChange={(event) => setProvider(event.target.value as ModelProvider)}>
+              <option value="local">Local Model</option>
+              <option value="custom">Custom Model</option>
+            </select>
+          </label>
           <div className={`status-pill ${status}`}><span className="status-dot" />
-            {status === "online" ? "Model online" : status === "starting" ? "Starting model" : "Model offline"}
+            {status === "online" ? `${provider === "custom" ? "Custom" : "Local"} online` : status === "starting" ? "Checking model" : "Model offline"}
           </div>
-          {status === "offline" ? (
-            <button className="primary compact" onClick={startServer}><Play size={15} fill="currentColor" /> Start model</button>
-          ) : (
+          {status === "offline" && (
+            <button className="primary compact" onClick={startServer}><Play size={15} fill="currentColor" /> {provider === "custom" ? "Retry" : "Start model"}</button>
+          )}
+          {status === "online" && provider === "local" && (
             <button className="ghost compact" onClick={stopServer}><CircleStop size={16} /> Stop</button>
           )}
           <button className="icon-button" aria-label="Settings" onClick={() => setSettingsOpen((open) => !open)}><Settings2 size={18} /></button>
@@ -608,16 +672,37 @@ export default function App() {
       {settingsOpen && (
         <section className="settings-panel">
           <div className="settings-title">
-            <div><h2>Model server</h2><p>Requests are securely proxied through the Rust backend.</p></div>
+            <div><h2>Aeris settings</h2><p>Model credentials and requests stay behind the Rust backend.</p></div>
             <button className="icon-button" onClick={() => setSettingsOpen(false)}><ChevronDown size={18} /></button>
           </div>
           <div className="settings-grid">
-            <label className="wide">Model path<input value={config.modelPath} onChange={(e) => updateConfig("modelPath", e.target.value)} /></label>
-            <label className="wide">llama-server path<input value={config.binaryPath} onChange={(e) => updateConfig("binaryPath", e.target.value)} /></label>
-            <label>Context size<input type="number" value={config.contextSize} onChange={(e) => updateConfig("contextSize", Number(e.target.value))} /></label>
-            <label>GPU layers<input type="number" value={config.gpuLayers} onChange={(e) => updateConfig("gpuLayers", Number(e.target.value))} /></label>
-            <label>Host<input value={config.host} onChange={(e) => updateConfig("host", e.target.value)} /></label>
-            <label>Port<input type="number" value={config.port} onChange={(e) => updateConfig("port", Number(e.target.value))} /></label>
+            <div className="settings-divider wide"><span>MODEL PROVIDER</span><p>Choose the on-device LFM or your Kaggle-hosted API.</p></div>
+            <div className="provider-cards wide">
+              <button className={provider === "local" ? "active" : ""} onClick={() => setProvider("local")}><HardDrive size={17} /><span><strong>Local Model</strong><small>Private · runs on this Mac</small></span></button>
+              <button className={provider === "custom" ? "active" : ""} onClick={() => setProvider("custom")}><Cloud size={17} /><span><strong>Custom Model</strong><small>Kaggle API · configured via .env</small></span></button>
+            </div>
+            {provider === "local" ? <>
+              <div className="settings-divider wide"><span>LOCAL MODEL SETTINGS</span><p>llama-server runs only on this Mac.</p></div>
+              <label className="wide">Model path<input value={config.modelPath} onChange={(e) => updateConfig("modelPath", e.target.value)} /></label>
+              <label className="wide">llama-server path<input value={config.binaryPath} onChange={(e) => updateConfig("binaryPath", e.target.value)} /></label>
+              <label>Context size<input type="number" value={config.contextSize} onChange={(e) => updateConfig("contextSize", Number(e.target.value))} /></label>
+              <label>GPU layers<input type="number" value={config.gpuLayers} onChange={(e) => updateConfig("gpuLayers", Number(e.target.value))} /></label>
+              <label>Host<input value={config.host} onChange={(e) => updateConfig("host", e.target.value)} /></label>
+              <label>Port<input type="number" value={config.port} onChange={(e) => updateConfig("port", Number(e.target.value))} /></label>
+            </> : <>
+              <div className="settings-divider wide"><span>CUSTOM MODEL SETTINGS</span><p>Kaggle API credentials load securely from .env.</p></div>
+              <div className={`custom-model-summary wide ${customModel?.online ? "online" : "offline"}`}>
+                <span>{customModel?.online ? "Connected" : customModel?.configured ? "Unavailable" : "Not configured"}</span>
+                <strong>{customModelName}</strong>
+                <small>{customModel?.message ?? "Add BASE URL and API KEY to .env"}</small>
+              </div>
+              <label className="wide">API base URL<input value={customModel?.baseUrl ?? "Read from .env"} readOnly /></label>
+              <label className="wide">Detected model<input value={customModel?.modelId ?? "Waiting for /v1/models"} readOnly /></label>
+              <div className="custom-model-actions wide">
+                <span>The API key is never shown or stored in the webview.</span>
+                <button className="ghost compact" onClick={startServer}>Refresh connection</button>
+              </div>
+            </>}
             <div className="settings-divider wide"><span>PERSONA</span><p>These instructions shape every model response.</p></div>
             <label className="wide">Persona instructions
               <textarea value={persona.prompt} rows={8} onChange={(e) => setPersona((current) => ({ ...current, prompt: e.target.value }))} />
@@ -679,12 +764,12 @@ export default function App() {
             <div className="mini-metric"><Gauge size={14} /><div><span>Generation</span><strong>{tokensPerSecond.toFixed(1)} tok/s</strong></div></div>
           </div>
           <button className="clear-button" onClick={clearConversation} disabled={!messages.length}><Eraser size={15} /> Clear current chat</button>
-          <div className="model-label"><span>MODEL</span><p>LFM2.5 · 2.6B · Q4_K_M</p></div>
+          <div className="model-label"><span>MODEL</span><p>{provider === "custom" ? customModelName : "LFM2.5 · 2.6B · Q4_K_M"}</p></div>
         </aside>
 
         <section className="chat-panel">
           <div className="conversation-title">
-            <div className="conversation-meta"><span>{activeChat?.title ?? "New chat"}</span><small>Saved locally</small></div>
+            <div className="conversation-meta"><span>{activeChat?.title ?? "New chat"}</span><small>SQLite · Saved locally</small></div>
             <div className="mode-tabs" role="tablist" aria-label="Conversation mode">
               <button className={viewMode === "text" ? "active" : ""} disabled={voiceState === "listening" || voiceState === "transcribing"}
                 onClick={() => { setViewMode("text"); window.speechSynthesis?.cancel(); setVoiceState("idle"); }}><Keyboard size={13} /> Text</button>
@@ -697,14 +782,16 @@ export default function App() {
                 <div className="orb"><Bot size={32} /></div>
                 <h2>{loadingChats ? "Opening your chats…" : "Ready when you are, Rohan."}</h2>
                 <p>Your private personal AI assistant. Every conversation stays in a local SQLite database on your Mac.</p>
-                {status === "offline" && !loadingChats && <button className="primary" onClick={startServer}><Play size={16} fill="currentColor" /> Start local model</button>}
+                {status === "offline" && !loadingChats && <button className="primary" onClick={startServer}><Play size={16} fill="currentColor" /> {provider === "custom" ? "Retry Custom Model" : "Start local model"}</button>}
               </div>
             ) : messages.filter((message) => message.role !== "system").map((message) => (
               <article className={`message ${message.role}`} key={message.id}>
                 <div className="avatar">{message.role === "user" ? <UserRound size={16} /> : <Sparkles size={16} />}</div>
                 <div className="message-body">
                   <span>{message.role === "user" ? "You" : "Aeris"}</span>
-                  <p>{message.content}{generating && message.id === messages[messages.length - 1]?.id && <i className="cursor" />}</p>
+                  {message.role === "assistant" ? (
+                    <MarkdownMessage content={message.content} streaming={generating && message.id === messages[messages.length - 1]?.id} />
+                  ) : <p>{message.content}</p>}
                 </div>
               </article>
             ))}
@@ -723,10 +810,10 @@ export default function App() {
             <h2>{VOICE_LABELS[voiceState]}</h2>
             <p className="voice-transcript">{voiceTranscript || "Your voice is recorded only after you tap. Transcription stays local."}</p>
             {messages.filter((message) => message.role === "assistant").slice(-1)[0]?.content && voiceState !== "listening" && (
-              <p className="voice-response">{messages.filter((message) => message.role === "assistant").slice(-1)[0]?.content}</p>
+              <div className="voice-response"><MarkdownMessage content={messages.filter((message) => message.role === "assistant").slice(-1)[0].content} /></div>
             )}
             {error && <div className="error-banner voice-error">{error}</div>}
-            {status === "offline" && <button className="primary voice-start" onClick={startServer}><Play size={15} fill="currentColor" /> Start local model</button>}
+            {status === "offline" && <button className="primary voice-start" onClick={startServer}><Play size={15} fill="currentColor" /> {provider === "custom" ? "Retry Custom Model" : "Start local model"}</button>}
           </div>}
 
           {viewMode === "text" && <div className="composer-wrap">

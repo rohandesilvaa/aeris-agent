@@ -1,11 +1,12 @@
 use crate::{
     database::{finish_response, insert_message, load_messages, now_ms, DatabaseState},
-    models::{ChatRequest, Message, ServerConfig, StartResult, StreamEvent},
+    models::{ChatRequest, CustomModelInfo, Message, ServerConfig, StartResult, StreamEvent},
 };
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
+    env, fs,
     net::{SocketAddr, TcpStream},
     path::Path,
     process::{Child, Command, Stdio},
@@ -26,11 +27,134 @@ Address him as Rohan only when it feels natural, not in every response."#;
 
 pub const DEFAULT_AERIS_IDENTITY_RESPONSE: &str = "I'm Aeris, Rohan's personal AI assistant. I run privately on Rohan's Mac to help him think, create, plan, learn, and get things done.";
 
+const RESPONSE_FORMATTING_PROMPT: &str = r#"Format responses in clean Markdown when structure improves readability.
+Use short headings for distinct sections, bullet or numbered lists for steps, fenced code blocks with a language tag for code, and GitHub-Flavored Markdown tables for genuine comparisons or tabular data.
+Keep simple answers simple. Do not force headings or tables when a short paragraph is clearer. Never output raw HTML for visual formatting."#;
+
 #[derive(Default)]
 pub struct ServerState(pub Mutex<Option<Child>>);
 
 #[derive(Default)]
 pub struct GenerationState(pub Mutex<HashSet<String>>);
+
+struct CustomEndpoint {
+    base_url: String,
+    api_key: String,
+    model_id: Option<String>,
+}
+
+fn normalized_env_key(key: &str) -> String {
+    key.trim()
+        .trim_end_matches(':')
+        .to_ascii_uppercase()
+        .replace([' ', '-'], "_")
+}
+
+fn read_env_file(path: &Path) -> HashMap<String, String> {
+    let Ok(contents) = fs::read_to_string(path) else {
+        return HashMap::new();
+    };
+    contents
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                return None;
+            }
+            let (key, value) = line.split_once('=').or_else(|| line.split_once(':'))?;
+            Some((
+                normalized_env_key(key),
+                value.trim().trim_matches(['\'', '"']).to_string(),
+            ))
+        })
+        .collect()
+}
+
+fn custom_env_values() -> HashMap<String, String> {
+    let mut values = HashMap::new();
+    for key in [
+        "CUSTOM_MODEL_BASE_URL",
+        "CUSTOM_MODEL_API_KEY",
+        "CUSTOM_MODEL_ID",
+        "BASE_URL",
+        "PUBLIC_URL",
+        "API_KEY",
+        "MODEL_ID",
+    ] {
+        if let Ok(value) = env::var(key) {
+            values.insert(key.to_string(), value);
+        }
+    }
+    let manifest_env = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .map(|path| path.join(".env"));
+    let current_env = env::current_dir().ok().map(|path| path.join(".env"));
+    for path in [manifest_env, current_env].into_iter().flatten() {
+        for (key, value) in read_env_file(&path) {
+            values.entry(key).or_insert(value);
+        }
+    }
+    values
+}
+
+fn load_custom_endpoint() -> Result<CustomEndpoint, String> {
+    let values = custom_env_values();
+    let raw_base = values
+        .get("CUSTOM_MODEL_BASE_URL")
+        .or_else(|| values.get("BASE_URL"))
+        .cloned()
+        .or_else(|| {
+            values
+                .get("PUBLIC_URL")
+                .map(|url| format!("{}/v1", url.trim_end_matches('/')))
+        })
+        .ok_or("Custom Model BASE URL is missing from .env")?;
+    let api_key = values
+        .get("CUSTOM_MODEL_API_KEY")
+        .or_else(|| values.get("API_KEY"))
+        .filter(|value| !value.trim().is_empty())
+        .cloned()
+        .ok_or("Custom Model API KEY is missing from .env")?;
+    let model_id = values
+        .get("CUSTOM_MODEL_ID")
+        .or_else(|| values.get("MODEL_ID"))
+        .filter(|value| !value.trim().is_empty())
+        .cloned();
+    Ok(CustomEndpoint {
+        base_url: raw_base.trim_end_matches('/').to_string(),
+        api_key,
+        model_id,
+    })
+}
+
+async fn fetch_custom_model_id(
+    client: &reqwest::Client,
+    endpoint: &CustomEndpoint,
+) -> Result<String, String> {
+    if let Some(model_id) = &endpoint.model_id {
+        return Ok(model_id.clone());
+    }
+    let response = client
+        .get(format!("{}/models", endpoint.base_url))
+        .bearer_auth(&endpoint.api_key)
+        .send()
+        .await
+        .map_err(|error| format!("Could not reach Custom Model: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "Custom Model authentication failed ({})",
+            response.status()
+        ));
+    }
+    response
+        .json::<Value>()
+        .await
+        .map_err(|error| format!("Invalid Custom Model response: {error}"))?
+        .pointer("/data/0/id")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| "Custom Model API returned no model ID.".to_string())
+}
 
 fn port_is_open(host: &str, port: u16) -> bool {
     let Ok(address) = format!("{host}:{port}").parse::<SocketAddr>() else {
@@ -131,6 +255,54 @@ pub async fn check_server(config: ServerConfig) -> bool {
 }
 
 #[tauri::command]
+pub async fn check_custom_model() -> CustomModelInfo {
+    let endpoint = match load_custom_endpoint() {
+        Ok(endpoint) => endpoint,
+        Err(message) => {
+            return CustomModelInfo {
+                configured: false,
+                online: false,
+                model_id: None,
+                base_url: None,
+                message,
+            };
+        }
+    };
+    let base_url = Some(endpoint.base_url.clone());
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => {
+            return CustomModelInfo {
+                configured: true,
+                online: false,
+                model_id: None,
+                base_url,
+                message: error.to_string(),
+            };
+        }
+    };
+    match fetch_custom_model_id(&client, &endpoint).await {
+        Ok(model_id) => CustomModelInfo {
+            configured: true,
+            online: true,
+            model_id: Some(model_id),
+            base_url,
+            message: "Custom Model online".into(),
+        },
+        Err(message) => CustomModelInfo {
+            configured: true,
+            online: false,
+            model_id: None,
+            base_url,
+            message,
+        },
+    }
+}
+
+#[tauri::command]
 pub fn cancel_generation(
     request_id: String,
     state: State<'_, GenerationState>,
@@ -208,7 +380,13 @@ pub async fn stream_chat(
         1_000,
     );
     if is_identity_question(&user_message.content) {
-        let content = identity_response;
+        let content = if request.provider == "custom" {
+            format!(
+                "{identity_response} My current language model is connected through Rohan's Custom Model API."
+            )
+        } else {
+            identity_response
+        };
         let _ = on_event.send(StreamEvent::chunk(
             &request.request_id,
             &request.chat_id,
@@ -244,7 +422,12 @@ pub async fn stream_chat(
         return Ok(());
     }
     let history = load_messages(&database, &request.chat_id)?;
-    let persona_prompt = bounded_setting(&request.persona_prompt, DEFAULT_AERIS_PERSONA, 8_000);
+    let mut persona_prompt = bounded_setting(&request.persona_prompt, DEFAULT_AERIS_PERSONA, 8_000);
+    persona_prompt.push_str("\n\n");
+    persona_prompt.push_str(RESPONSE_FORMATTING_PROMPT);
+    if request.provider == "custom" {
+        persona_prompt.push_str("\nThis conversation is powered by Rohan's Custom Model API hosted from Kaggle. The Aeris app and chat memory remain on Rohan's Mac, but do not claim that this response's inference ran locally.");
+    }
     let mut api_messages = vec![json!({ "role": "system", "content": persona_prompt })];
     api_messages.extend(
         history
@@ -252,29 +435,52 @@ pub async fn stream_chat(
             .map(|message| json!({ "role": message.role, "content": message.content })),
     );
     let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(20))
         .build()
         .map_err(|error| error.to_string())?;
-    let response = client
-        .post(format!("{}/v1/chat/completions", request.config.base_url()))
+    let custom_endpoint = if request.provider == "custom" {
+        Some(load_custom_endpoint()?)
+    } else {
+        None
+    };
+    let (api_base, model_id) = if let Some(endpoint) = &custom_endpoint {
+        (
+            endpoint.base_url.clone(),
+            fetch_custom_model_id(&client, endpoint).await?,
+        )
+    } else {
+        (
+            format!("{}/v1", request.config.base_url()),
+            "local-model".into(),
+        )
+    };
+    let mut response_request = client
+        .post(format!("{api_base}/chat/completions"))
         .json(&json!({
-            "model": "local-model",
+            "model": model_id,
             "messages": api_messages,
             "stream": true,
             "stream_options": { "include_usage": true },
             "temperature": 0.5,
             "min_p": 0.15
-        }))
-        .send()
-        .await
-        .map_err(|error| {
-            let message = format!("Could not reach the local model: {error}");
-            let _ = on_event.send(StreamEvent::error(
-                &request.request_id,
-                &request.chat_id,
-                message.clone(),
-            ));
-            message
-        })?;
+        }));
+    if let Some(endpoint) = &custom_endpoint {
+        response_request = response_request.bearer_auth(&endpoint.api_key);
+    }
+    let response = response_request.send().await.map_err(|error| {
+        let label = if request.provider == "custom" {
+            "Custom Model"
+        } else {
+            "local model"
+        };
+        let message = format!("Could not reach the {label}: {error}");
+        let _ = on_event.send(StreamEvent::error(
+            &request.request_id,
+            &request.chat_id,
+            message.clone(),
+        ));
+        message
+    })?;
     if !response.status().is_success() {
         let status = response.status();
         let detail = response.text().await.unwrap_or_default();
@@ -406,7 +612,8 @@ fn bounded_setting(value: &str, fallback: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{bounded_setting, is_identity_question};
+    use super::{bounded_setting, is_identity_question, read_env_file};
+    use std::fs;
 
     #[test]
     fn detects_common_identity_questions() {
@@ -430,5 +637,27 @@ mod tests {
         );
         assert_eq!(bounded_setting("   ", "Default", 100), "Default");
         assert_eq!(bounded_setting("123456", "Default", 4), "1234");
+    }
+
+    #[test]
+    fn reads_standard_and_human_readable_env_keys() {
+        let path =
+            std::env::temp_dir().join(format!("aeris-env-test-{}.env", uuid::Uuid::new_v4()));
+        fs::write(
+            &path,
+            "BASE URL: https://example.test/v1\nAPI KEY: secret\nCUSTOM_MODEL_ID=model-one\n",
+        )
+        .expect("write env fixture");
+        let values = read_env_file(&path);
+        let _ = fs::remove_file(path);
+        assert_eq!(
+            values.get("BASE_URL").map(String::as_str),
+            Some("https://example.test/v1")
+        );
+        assert_eq!(values.get("API_KEY").map(String::as_str), Some("secret"));
+        assert_eq!(
+            values.get("CUSTOM_MODEL_ID").map(String::as_str),
+            Some("model-one")
+        );
     }
 }
