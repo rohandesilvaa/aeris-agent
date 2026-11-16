@@ -3,6 +3,6 @@
 <plist version="1.0">
 <dict>
   <key>NSMicrophoneUsageDescription</key>
-  <string>Aeris uses the microphone only when Rohan starts Voice mode. Recordings are transcribed locally.</string>
+  <string>Aeris Bot uses the microphone only when you start Voice mode. Recordings are transcribed on this Mac.</string>
 </dict>
 </plist>

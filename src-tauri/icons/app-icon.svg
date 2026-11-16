@@ -1,6 +1,21 @@
-<svg width="1024" height="1024" viewBox="0 0 1024 1024" fill="none" xmlns="http://www.w3.org/2000/svg">
-  <rect width="1024" height="1024" rx="228" fill="#8FF0B5"/>
-  <path d="M512 180C522 358 578 414 756 424C578 434 522 490 512 668C502 490 446 434 268 424C446 414 502 358 512 180Z" fill="#0A1710"/>
-  <path d="M741 590C746 681 775 710 866 715C775 720 746 749 741 840C736 749 707 720 616 715C707 710 736 681 741 590Z" fill="#0A1710"/>
-  <path d="M287 592C291 657 312 678 377 682C312 686 291 707 287 772C283 707 262 686 197 682C262 678 283 657 287 592Z" fill="#0A1710"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="plate" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#17233a"/>
+      <stop offset="1" stop-color="#060a11"/>
+    </linearGradient>
+    <radialGradient id="halo" cx="50%" cy="62%" r="46%">
+      <stop offset="0" stop-color="#8edeff" stop-opacity="0.42"/>
+      <stop offset="1" stop-color="#8edeff" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="mark" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#86dcff"/>
+    </linearGradient>
+  </defs>
+  <rect x="100" y="100" width="824" height="824" rx="186" fill="url(#plate)"/>
+  <rect x="100" y="100" width="824" height="824" rx="186" fill="url(#halo)"/>
+  <rect x="101.5" y="101.5" width="821" height="821" rx="184.5" fill="none" stroke="#a9dcff" stroke-opacity="0.18" stroke-width="3"/>
+  <path d="M348 730 L512 296 L676 730" fill="none" stroke="url(#mark)" stroke-width="86" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="512" cy="622" r="46" fill="#8edeff"/>
 </svg>

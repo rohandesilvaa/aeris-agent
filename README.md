@@ -1,64 +1,71 @@
-# Aeris
+# Aeris Bot
 
-Rohan's private personal AI agent, built with Tauri, Rust, React, SQLite, and a local `llama-server` model.
+Rohan's private team of AI teammates, as a macOS app. Built with Tauri, Rust, React, and SQLite. Every teammate thinks with Claude through the Claude Code CLI.
 
-## Custom Model provider
+## What it does
 
-Aeris can switch between the on-device LFM and an OpenAI-compatible Custom Model API hosted from a Kaggle notebook. Select **Custom Model** in the title bar or Settings. The Rust backend reads credentials from `.env`, discovers the model through `/v1/models`, and proxies streaming `/v1/chat/completions` responses without exposing the API key to the webview or localStorage.
+- **Teammates.** Aeris, the chief of staff, is always there. Add your own teammates, each with a name, a role, a description of what it owns, and instructions for how it works.
+- **Threads.** Each teammate has its own conversation threads, stored in a local SQLite database.
+- **Memory.** After each reply a teammate updates a short list of lasting facts (preferences, projects, decisions). The list is carried into every thread with that teammate, and you can read, edit, or clear it.
+- **Specialists.** Turn on "Specialists" for a message and four agents work first: Atlas (research, with web search), Vega (reasoning), and Nova (ideas) run in parallel, Argus reviews their notes, and the teammate writes the final reply. Their notes are saved with the reply.
+- **Handoffs.** Any teammate can ask another for help with the `ask_teammate` tool. The other teammate answers with its own instructions and memory, and the question and answer are shown and saved with the reply.
+- **Groups.** A group thread has two to six teammates. The first one leads and answers by default; `@name` chooses who answers, and several mentions answer in that order. Each teammate sees the whole thread, labelled by author.
+- **Skills.** A shared library of saved procedures. Teammates see each skill's name and when to use it, and load the full steps with the `use_skill` tool when a task calls for it. "Save as skill" under a reply drafts one from the thread for you to review.
+- **Routines.** A routine sends a teammate the same request on a schedule (hourly, daily, Monday to Friday, or weekly) and keeps the replies in one thread. Routines run while the app is open; a missed run is caught up once at the next start. Nobody is there to approve, so commands never run in a routine, and file writes go ahead only if you turned that on for the routine.
+- **Plugins.** Add outside tool servers (MCP) by command or URL. Each plugin is off, asks before every use, or is allowed without asking. Plugins are passed to Claude Code only for a teammate's own reply; Claude Code's own MCP configuration is never loaded. Keys are stored unencrypted in the app's database.
+- **Workspace.** Teammates share one folder on this Mac (`~/Aeris Bot Workspace` by default). A teammate with workspace access can read files there freely; every file write and every shell command waits for your approval in the thread. Files outside the folder cannot be opened by the file tools. What a teammate did is listed above its reply.
+- **Voice.** Speak to a teammate (transcribed on this Mac by `whisper-server`) and hear replies read by a macOS voice. A hologram face shows whether the teammate is listening, working, or replying.
 
-Local Model and Custom Model have separate conditional settings panels. Regardless of the selected provider, chat sessions and completed responses are stored in the same local SQLite database on the Mac.
+## Model
 
-Assistant messages render safe GitHub-Flavored Markdown, including headings, lists, blockquotes, fenced code blocks, links, and tables. Raw HTML from model output is not executed.
+Claude Code is the only model provider. The Rust backend runs `claude -p` and reads its JSON stream. A teammate's own reply runs in the workspace folder in Claude Code's restricted mode, with permission questions answered by the app. Specialists and memory updates run in an empty folder with no file or command tools.
 
-Copy `.env.example` to `.env` and set `CUSTOM_MODEL_BASE_URL` and `CUSTOM_MODEL_API_KEY`. `CUSTOM_MODEL_ID` is optional. The existing human-readable `BASE URL:` and `API KEY:` labels are also supported.
+Sign in once in Terminal:
 
-## Phase 2 features
+```bash
+claude auth login
+```
 
-- Multiple local chat sessions with create, switch, rename, clear, and delete actions
-- SQLite-backed chat and message persistence
-- Automatic migration of the original localStorage conversation
-- Rust inference proxy with cancellable streaming over Tauri channels
-- Per-chat context usage and generation speed
-- Rust-managed `llama-server` lifecycle with one inference slot for lower memory use
-
-## Voice mode
-
-- Dedicated Text and Voice tabs
-- Animated Aeris voice core with listening, transcribing, thinking, and speaking states
-- Push-to-talk microphone recording
-- Fully local English transcription through a persistent `whisper-server` on `127.0.0.1:8092`
-- CPU-only `small.en-q5_1` inference to balance accuracy and speed without competing with the LFM server for Metal memory
-- macOS speech synthesis for spoken Aeris responses
-- Editable Whisper binary, multilingual model, ffmpeg, and language settings
-
-The SQLite database is stored in the app's macOS Application Support directory under the original `com.rohan.aeris-local` identifier so upgrades retain existing chats. Model requests remain local and are proxied by the Rust backend; the webview does not connect to the model server directly.
+Choose the Claude model in Settings. Memory updates always use Haiku.
 
 ## Development
 
-Requirements: Node.js 20+, Rust stable, `llama-server`, the GGUF model file, `ffmpeg`, and `whisper-cli` from `whisper.cpp`.
+Requirements: Node.js 20+, Rust stable, and the Claude Code CLI. Voice also needs `ffmpeg` and `whisper.cpp`.
 
 ```bash
 pnpm install
-pnpm tauri dev
 ```
-
-Create an optimized macOS app with:
 
 ```bash
-pnpm tauri build
+./node_modules/.bin/tauri dev
 ```
 
-The generated app is at `src-tauri/target/release/bundle/macos/Aeris.app`.
+To design the interface in a plain browser, run `./node_modules/.bin/vite` and open http://127.0.0.1:1420. Outside the Tauri window the app uses a simulated backend (`src/devMock.ts`).
 
-The default settings point to:
+Build the macOS app:
 
-- Model: `/Volumes/ROHAN DISK/Local Models/LFM2.5-2.6B-Q4_K_M.gguf`
-- Server: `/opt/homebrew/bin/llama-server`
-- Context: `16384`
-- GPU layers: `99`
-- API: `127.0.0.1:8080`
-- Whisper: `/opt/homebrew/bin/whisper-cli`
-- Whisper model: `/Volumes/ROHAN DISK/Local Models/ggml-small.en-q5_1.bin`
-- ffmpeg: `/opt/homebrew/bin/ffmpeg`
+```bash
+./node_modules/.bin/tauri build
+```
 
-Use the settings button in the title bar to change any of these values.
+The app is written to `src-tauri/target/release/bundle/macos/Aeris Bot.app`.
+
+## Data
+
+The database is `aeris.sqlite3` in the app's Application Support directory, under the identifier `com.rohan.aeris-local`. Chats and memory stay on this Mac. Messages are sent to Anthropic to generate replies.
+
+## Layout
+
+| Path | What it holds |
+|---|---|
+| `src/App.tsx` | App state and the three-column layout |
+| `src/components/` | Hologram face, teammate editor, settings, specialists card |
+| `src-tauri/src/inference.rs` | The chat command and system prompts |
+| `src-tauri/src/agents.rs` | The specialist team |
+| `src-tauri/src/claude_code.rs` | Running the Claude Code CLI and reading its stream |
+| `src-tauri/src/memory.rs` | Long-term memory rules |
+| `src-tauri/src/plugins.rs` | Plugins (MCP servers) and their access rules |
+| `src-tauri/src/skills.rs` | The skills library and drafting a skill from a thread |
+| `src-tauri/src/routines.rs` | Routines and their scheduler |
+| `src-tauri/src/database.rs` | SQLite schema, teammates, threads |
+| `src-tauri/src/voice.rs` | Local speech transcription |
